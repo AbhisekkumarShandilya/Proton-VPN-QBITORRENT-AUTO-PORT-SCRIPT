@@ -2,10 +2,16 @@
 
 <#
 .SYNOPSIS
-    Synchronizes qBittorrent listening port with ProtonVPN.
+    Keeps qBittorrent's listening port in sync with ProtonVPN's forwarded port.
 .DESCRIPTION
-    Securely loads credentials via DPAPI, detects the VPN port (handling file locks),
-    and updates qBittorrent settings.
+    Watches ProtonVPN's port.txt for changes and pushes the new port to qBittorrent
+    via its Web API as soon as it changes, instead of polling on a fixed interval.
+    Falls back to a periodic check every 60s in case a file-system event is missed.
+
+    Run this as a long-lived process (e.g. a Scheduled Task triggered "At log on").
+.NOTES
+    Create the credential file once with:
+        Get-Credential | Export-Clixml -Path '.\qbit_creds.xml'
 #>
 
 [CmdletBinding()]
@@ -14,17 +20,42 @@ param(
     [string]$QBitUrl = "http://localhost:8080",
 
     [Parameter(Mandatory = $false)]
-    [string]$CredFilePath = "$PSScriptRoot\qbit_creds.xml"
+    [string]$CredFilePath = "$PSScriptRoot\qbit_creds.xml",
+
+    [Parameter(Mandatory = $false)]
+    [string]$StateFilePath = "$PSScriptRoot\last_port.txt",
+
+    [Parameter(Mandatory = $false)]
+    [string]$LogFilePath = "$PSScriptRoot\sync.log"
 )
 
+$script:Session = $null
+
 # ==============================================================================
-# 1. CREDENTIAL MANAGEMENT (DPAPI)
+# LOGGING
+# ==============================================================================
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet("INFO", "WARN", "ERROR")][string]$Level = "INFO"
+    )
+    $line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    Add-Content -Path $LogFilePath -Value $line
+    switch ($Level) {
+        "ERROR" { Write-Host $line -ForegroundColor Red }
+        "WARN"  { Write-Host $line -ForegroundColor Yellow }
+        default { Write-Host $line -ForegroundColor Gray }
+    }
+}
+
+# ==============================================================================
+# CREDENTIAL MANAGEMENT (DPAPI)
 # ==============================================================================
 function Get-QBitCredentials {
     param ([string]$Path)
 
     if (-not (Test-Path $Path)) {
-        Write-Warning "Credential file not found at: $Path"
+        Write-Log "Credential file not found at: $Path" "ERROR"
         Write-Host "To create this file securely, run the following command ONCE in PowerShell:"
         Write-Host "----------------------------------------------------------------------"
         Write-Host "Get-Credential | Export-Clixml -Path '$Path'"
@@ -42,110 +73,136 @@ function Get-QBitCredentials {
 }
 
 # ==============================================================================
-# 2. PORT DETECTION (LOCK-SAFE)
+# QBITTORRENT API INTERACTION
 # ==============================================================================
-function Get-ProtonVPNPort {
-    # Method A: Check standard text file
-    $protonDataPath = Join-Path $env:LOCALAPPDATA "ProtonVPN"
-    $portFile = Join-Path $protonDataPath "port.txt"
-    
-    if (Test-Path -Path $portFile) {
-        $content = Get-Content -Path $portFile -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($content -match '^\d{4,5}$') { return [int]$content }
+function Get-QBitSession {
+    param([Parameter(Mandatory)]$Creds)
+
+    $loginUri = "$QBitUrl/api/v2/auth/login"
+    $body = @{
+        username = $Creds.UserName
+        password = $Creds.GetNetworkCredential().Password
     }
 
-    # Method B: Check Windows Notification DB (Lock-Safe)
-    $dbPath = Join-Path $env:LOCALAPPDATA "Microsoft\Windows\Notifications\AppDb.db"
-    if (Test-Path -Path $dbPath) {
-        $tempPath = [System.IO.Path]::GetTempFileName()
-        $fileStream = $null
-        try {
-            # Open file with FileShare.ReadWrite to allow reading even if locked by OS
-            $fileStream = [System.IO.File]::Open($dbPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-            $destStream = [System.IO.File]::Create($tempPath)
-            $fileStream.CopyTo($destStream)
-            
-            # Flush and close streams before reading
-            $destStream.Close()
-            $fileStream.Close()
-
-            # Parse the temp copy
-            $matches = Select-String -Path $tempPath -Pattern "(?<=port: )\d{4,5}" -AllMatches
-            if ($matches) {
-                return [int]($matches.Matches | Select-Object -Last 1 -ExpandProperty Value)
-            }
-        }
-        catch {
-            Write-Warning "Could not extract port from AppDb: $_"
-        }
-        finally {
-            if ($fileStream) { $fileStream.Dispose() }
-            if (Test-Path $tempPath) { Remove-Item $tempPath -Force -ErrorAction SilentlyContinue }
-        }
-    }
-    return $null
+    $session = $null
+    Invoke-RestMethod -Uri $loginUri -Method Post -Body $body -SessionVariable 'session' -ErrorAction Stop | Out-Null
+    return $session
 }
 
-# ==============================================================================
-# 3. QBITTORRENT API INTERACTION
-# ==============================================================================
-function Update-QBittorrentConfiguration {
+function Update-QBittorrentPort {
     param(
-        [Parameter(Mandatory)]$WebSession,
-        [int]$NewPort
+        [Parameter(Mandatory)][int]$NewPort,
+        [Parameter(Mandatory)]$Creds
     )
 
-    $currentPort = try {
-        (Invoke-RestMethod -Uri "$QBitUrl/api/v2/app/preferences" -Method Get -WebSession $WebSession -ErrorAction Stop).listen_port
-    } catch { $null }
-
-    if ($null -ne $currentPort -and $currentPort -ne $NewPort) {
-        Write-Host "Updating Port: $currentPort -> $NewPort" -ForegroundColor Cyan
-        
-        # Use PSCustomObject for clean JSON generation
-        $payload = [PSCustomObject]@{ 
-            listen_port = $NewPort 
-        } | ConvertTo-Json
-
-        Invoke-RestMethod -Uri "$QBitUrl/api/v2/app/setPreferences" `
-            -Method Post `
-            -WebSession $WebSession `
-            -Body $payload `
-            -ContentType "application/json"
+    if (-not $script:Session) {
+        $script:Session = Get-QBitSession -Creds $Creds
     }
-    else {
-        Write-Host "Port is already set to $currentPort. No action needed." -ForegroundColor Green
+
+    try {
+        $currentPort = (Invoke-RestMethod -Uri "$QBitUrl/api/v2/app/preferences" -Method Get -WebSession $script:Session -ErrorAction Stop).listen_port
+    }
+    catch {
+        # Session likely expired - re-authenticate once and retry.
+        $script:Session = Get-QBitSession -Creds $Creds
+        $currentPort = (Invoke-RestMethod -Uri "$QBitUrl/api/v2/app/preferences" -Method Get -WebSession $script:Session -ErrorAction Stop).listen_port
+    }
+
+    if ($currentPort -eq $NewPort) {
+        Write-Log "qBittorrent is already on port $NewPort. No action needed."
+        return
+    }
+
+    $payload = [PSCustomObject]@{ listen_port = $NewPort } | ConvertTo-Json
+
+    Invoke-RestMethod -Uri "$QBitUrl/api/v2/app/setPreferences" `
+        -Method Post `
+        -WebSession $script:Session `
+        -Body $payload `
+        -ContentType "application/json"
+
+    Write-Log "Updated qBittorrent port: $currentPort -> $NewPort"
+}
+
+# ==============================================================================
+# PORT SYNC
+# ==============================================================================
+function Sync-Port {
+    param([Parameter(Mandatory)]$Creds)
+
+    $portFile = Join-Path $env:LOCALAPPDATA "ProtonVPN\port.txt"
+
+    if (-not (Test-Path $portFile)) {
+        Write-Log "port.txt not found. Is ProtonVPN connected with port forwarding enabled?" "WARN"
+        return
+    }
+
+    # The file can be mid-write when the event fires; retry briefly.
+    $content = $null
+    for ($i = 0; $i -lt 5; $i++) {
+        $content = Get-Content -Path $portFile -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($content -match '^\d{4,5}$') { break }
+        Start-Sleep -Milliseconds 200
+    }
+
+    if ($content -notmatch '^\d{4,5}$') {
+        Write-Log "Could not parse a valid port from port.txt (content: '$content')." "WARN"
+        return
+    }
+
+    $newPort = [int]$content
+    $lastPort = if (Test-Path $StateFilePath) { Get-Content $StateFilePath -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
+
+    if ($lastPort -eq "$newPort") {
+        return
+    }
+
+    try {
+        Update-QBittorrentPort -NewPort $newPort -Creds $Creds
+        Set-Content -Path $StateFilePath -Value $newPort
+    }
+    catch {
+        Write-Log "Failed to sync port to qBittorrent: $_" "ERROR"
     }
 }
 
 # ==============================================================================
-# MAIN LOGIC
+# MAIN
 # ==============================================================================
+$Creds = Get-QBitCredentials -Path $CredFilePath
+$watchDir = Join-Path $env:LOCALAPPDATA "ProtonVPN"
+
+if (-not (Test-Path $watchDir)) {
+    Write-Log "ProtonVPN data directory not found at $watchDir. Is ProtonVPN installed?" "ERROR"
+    exit 1
+}
+
+Write-Log "Started. Watching '$watchDir\port.txt' for changes."
+Sync-Port -Creds $Creds
+
+$watcher = New-Object System.IO.FileSystemWatcher
+$watcher.Path = $watchDir
+$watcher.Filter = "port.txt"
+$watcher.NotifyFilter = [System.IO.NotifyFilters]::LastWrite
+$watcher.EnableRaisingEvents = $true
+
+Register-ObjectEvent -InputObject $watcher -EventName Changed -SourceIdentifier "PortFileChanged" | Out-Null
+Register-ObjectEvent -InputObject $watcher -EventName Created -SourceIdentifier "PortFileCreated" | Out-Null
+
 try {
-    # 1. Get Credentials
-    $Creds = Get-QBitCredentials -Path $CredFilePath
-
-    # 2. Authenticate
-    $loginUri = "$QBitUrl/api/v2/auth/login"
-    $Body = @{ 
-        username = $Creds.UserName
-        password = $Creds.GetNetworkCredential().Password 
-    }
-    
-    $Session = $null
-    Invoke-RestMethod -Uri $loginUri -Method Post -Body $Body -SessionVariable 'Session' -ErrorAction Stop | Out-Null
-
-    # 3. Get VPN Port
-    $vpnPort = Get-ProtonVPNPort
-    
-    if ($vpnPort) {
-        # 4. Update qBittorrent
-        Update-QBittorrentConfiguration -WebSession $Session -NewPort $vpnPort
-    }
-    else {
-        Write-Warning "Could not detect an active ProtonVPN port."
+    while ($true) {
+        # Wake on a file event, or every 60s as a safety net in case an event is missed.
+        $event = Wait-Event -Timeout 60
+        if ($event) {
+            Get-Event | Remove-Event -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500 # debounce rapid-fire writes
+        }
+        Sync-Port -Creds $Creds
     }
 }
-catch {
-    Write-Error "Script failed: $_"
+finally {
+    Unregister-Event -SourceIdentifier "PortFileChanged" -ErrorAction SilentlyContinue
+    Unregister-Event -SourceIdentifier "PortFileCreated" -ErrorAction SilentlyContinue
+    $watcher.Dispose()
+    Write-Log "Stopped."
 }
