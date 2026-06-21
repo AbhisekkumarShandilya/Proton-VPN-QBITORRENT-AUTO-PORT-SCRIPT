@@ -1,6 +1,8 @@
 # Proton-VPN-QBITORRENT-AUTO-PORT-SCRIPT
 Keeps qBittorrent's listening port in sync with ProtonVPN's forwarded port, automatically, on Windows.
 
+Current version: **1.0.0** — see [CHANGELOG.md](CHANGELOG.md) for release history.
+
 ## How it works
 ProtonVPN's Windows client writes the active forwarded port to
 `%LOCALAPPDATA%\ProtonVPN\port.txt` while port forwarding is enabled. The script
